@@ -82,7 +82,7 @@ def plot_airfoil_from_file(filename, grid_width, grid_height):
     plt.savefig('outputs/airfoil_from_file.png')
 
 # change parameters here
-scale = 10
+scale = 5
 padding = 0.5
 xu, yu, xl, yl = naca4('4312', tilt_angle=-10)
 write_airfoil_to_grid(xu, yu, xl, yl, grid_width=90 * scale, grid_height=60 * scale, padding_left=padding, padding_right=padding, padding_vertical=padding, filename='outputs/airfoil_coordinates.txt')

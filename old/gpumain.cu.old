@@ -24,16 +24,16 @@ float* smoke;
 float* smoke2;
 int* barrier;
 
-const int scale = 10;
+const int scale = 5;
 const int xSize = 90 * scale;
 const int ySize = 60 * scale;
 const int cellCount = xSize * ySize;
 const int renderScale = 2;
 const int stepsPerFrame = 5;
 const float tau = 0.6;
-const float inletVelocity = 0.025f;
+const float inletVelocity = 0.1f;
 const float velocityRange = inletVelocity / 2;
-const float smokeAdvectionScale = 20;
+const float smokeAdvectionScale = 10;
 bool showSmoke = false;
 
 int directionXVector[] = {0, 0, 0, 1, -1, 1, -1, -1, 1};
@@ -46,7 +46,53 @@ __constant__ int d_directionYVector[9];
 __constant__ float d_directionWeights[9];
 __constant__ int d_oppositeDirection[9];
 
+__constant__ float d_transformationMatrix[9][9];
+__constant__ float d_transformationMatrixInverse[9][9];
+__constant__ float d_relaxationRates[9];
+
 __constant__ float d_tau;
+
+//https://pmc.ncbi.nlm.nih.gov/articles/PMC6266048/
+//file:///home/hwang/Downloads/The_use_of_MRT-lattice_Boltzmann_method_for_the_pr.pdf
+//https://scispace.com/pdf/investigation-of-the-lattice-boltzmann-srt-and-mrt-stability-1r05h1lnm9.pdf
+//https://physics.weber.edu/schroeder/javacourse/LatticeBoltzmann.pdf
+//https://personal.ems.psu.edu/~fkd/courses/EGEE520/2017Deliverables/LBM_2017.pdf
+
+float transformationMatrix[9][9] = {
+    {1,   1,  1,  1,  1,  1,  1,  1,  1},
+    {-4, -1, -1, -1, -1,  2,  2,  2,  2},
+    {4,  -2, -2, -2, -2,  1,  1,  1,  1},
+    {0,   0,  0,  1, -1,  1, -1, -1,  1},
+    {0,   0,  0, -2,  2,  1, -1, -1,  1},
+    {0,   1, -1,  0,  0,  1, -1,  1, -1}, 
+    {0,  -2,  2,  0,  0,  1, -1,  1, -1},  
+    {0,  -1, -1,  1,  1,  0,  0,  0,  0},  
+    {0,   0,  0,  0,  0,  1,  1, -1, -1} 
+};
+
+float transformationMatrixInverse[9][9] = {
+    {1.0/9, -1.0/9, 1.0/9, 0, 0, 0, 0, 0, 0},
+    {1.0/9, -1.0/36, -1.0/18, 0, 0, 1.0/6, -1.0/6, -1.0/4, 0},
+    {1.0/9, -1.0/36, -1.0/18, 0, 0, -1.0/6, 1.0/6, -1.0/4, 0},
+    {1.0/9, -1.0/36, -1.0/18, 1.0/6, -1.0/6, 0, 0, 1.0/4, 0},
+    {1.0/9, -1.0/36, -1.0/18, -1.0/6, 1.0/6, 0, 0, 1.0/4, 0 },
+    {1.0/9, 1.0/18, 1.0/36, 1.0/6, 1.0/12,  1.0/6, 1.0/12, 0, 1.0/4 },
+    {1.0/9, 1.0/18, 1.0/36, -1.0/6, -1.0/12, -1.0/6, -1.0/12, 0, 1.0/4},
+    {1.0/9, 1.0/18, 1.0/36, -1.0/6, -1.0/12,  1.0/6, 1.0/12, 0, -1.0/4},
+    {1.0/9, 1.0/18, 1.0/36, 1.0/6, 1.0/12, -1.0/6, -1.0/12, 0, -1.0/4}
+};
+
+float relaxationRates[9] = {
+    0.0f,       //Density
+    1.6f,       //Energy Mode
+    1.6f,       //Higher Energy
+    0.0f,       //X Momentum
+    1.2f,       //X Energy Flux
+    0.0f,       //Y Momentum
+    1.2f,       //Y Energy Flux
+    1.0f / tau, //Stress
+    1.0f / tau  //Stress
+};
 
 const int threads = 128;
 const int blocks = (cellCount + threads - 1) / threads;
@@ -60,7 +106,7 @@ void parseBarrierFile(const std::string& filename, int* barrier) {
 
     int x, y;
     while (infile >> x >> y) {
-        barrier[y * xSize + x] = 1;  // Set the barrier
+        barrier[y * xSize + x] = 1;
     }
 
     infile.close();
@@ -90,14 +136,18 @@ void initialize() {
     cudaMemcpyToSymbol(d_directionWeights, directionWeights, sizeof(directionWeights));
     cudaMemcpyToSymbol(d_oppositeDirection, oppositeDirection, sizeof(oppositeDirection));
 
+    cudaMemcpyToSymbol(d_transformationMatrix, transformationMatrix, sizeof(transformationMatrix));
+    cudaMemcpyToSymbol(d_transformationMatrixInverse, transformationMatrixInverse, sizeof(transformationMatrixInverse));
+    cudaMemcpyToSymbol(d_relaxationRates, relaxationRates, sizeof(relaxationRates));
+
     cudaMemcpyToSymbol(d_tau, &tau, sizeof(float));
 
-    /*for (int n = 0; n < xSize; n++) {
+    for (int n = 0; n < xSize; n++) {
         barrier[n] = 1;
         barrier[(ySize - 1) * xSize + n] = 1;
-    }*/
+    }
 
-    parseBarrierFile("outputs/airfoil_coordinates.txt", barrier);
+    //parseBarrierFile("outputs/airfoil_coordinates.txt", barrier);
 
     int count = 0;
     for (int i = 0; i < cellCount; i++)
@@ -106,9 +156,9 @@ void initialize() {
     std::cout << "Barrier count = " << count << std::endl;
 
 
-    /*for (int n = 40; n < 60; n++) {
-        barrier[n * xSize + 50] = 1;
-    }*/
+    for (int n = ySize * 2 / 5; n < ySize * 3 / 5; n++) {
+        barrier[n * xSize + xSize / 3] = 1;
+    }
 
     float uSquared = inletVelocity * inletVelocity;
     for (int n = 0; n < cellCount; n++) {
@@ -151,27 +201,31 @@ sf::Color velocityToColor(int x, int y) {
     return sf::Color(r, g, b);
 }
 
-__global__ void collision(float* microDensity, float* macroDensity, float* xVelocity, float* yVelocity, int* barrier, int cellCount) {
+__global__ void collisionBGK(float* microDensity, float* macroDensity, float* xVelocity, float* yVelocity, int* barrier, int cellCount) {
     int n = threadIdx.x + blockIdx.x*blockDim.x;
     if (n >= cellCount || barrier[n] == 1) {
         return;
     }
     
+    float localDensity[9];
+
+    for (int d = 0; d < 9; d++) {
+        localDensity[d] = microDensity[d * cellCount + n];
+    }
+
     float totalDensity = 0.0f;
     float vX = 0.0f;
     float vY = 0.0f;
 
     for (int d = 0; d < 9; d++) {
-        float f = microDensity[d * cellCount + n];
+        float f = localDensity[d];
         totalDensity += f;
         vX += d_directionXVector[d] * f;
         vY += d_directionYVector[d] * f;
     }
 
-    if (totalDensity > 1e-6f) {
-        vX /= totalDensity;
-        vY /= totalDensity;
-    }
+    vX /= totalDensity;
+    vY /= totalDensity;
 
     xVelocity[n] = vX;
     yVelocity[n] = vY;
@@ -182,6 +236,74 @@ __global__ void collision(float* microDensity, float* macroDensity, float* xVelo
         float dotProduct = d_directionXVector[d] * vX + d_directionYVector[d] * vY;
         float equilibriumDensity = totalDensity * d_directionWeights[d] * (1.0f + 3.0f * dotProduct + 4.5f * dotProduct * dotProduct - 1.5f * uSquared);
         microDensity[d * cellCount + n] = (1.0f - 1.0f / d_tau) * microDensity[d * cellCount + n] + (1.0f / d_tau) * equilibriumDensity;
+    }
+}
+
+__global__ void collisionMRT(float* microDensity, float* macroDensity, float* xVelocity, float* yVelocity, int* barrier, int cellCount) {
+    int n = threadIdx.x + blockIdx.x*blockDim.x;
+    if (n >= cellCount || barrier[n] == 1) {
+        return;
+    }
+
+    float localDensity[9];
+
+    for (int d = 0; d < 9; d++) {
+        localDensity[d] = microDensity[d * cellCount + n];
+    }
+
+    float totalDensity = 0.0f;
+    float vX = 0.0f;
+    float vY = 0.0f;
+
+    for (int d = 0; d < 9; d++) {
+        float f = localDensity[d];
+        totalDensity += f;
+        vX += d_directionXVector[d] * f;
+        vY += d_directionYVector[d] * f;
+    }
+
+    vX /= totalDensity;
+    vY /= totalDensity;
+
+    macroDensity[n] = totalDensity;
+    xVelocity[n] = vX;
+    yVelocity[n] = vY;
+
+    float momentVector[9] = {0};
+
+    for (int i = 0; i < 9; i++) {
+        for (int j = 0; j < 9; j++) {
+            momentVector[i] += d_transformationMatrix[i][j] * localDensity[j];
+        }
+    }
+
+    float uSquared = vX * vX + vY * vY;
+
+    float equilibriumMomentVector[9];
+    equilibriumMomentVector[0] = totalDensity;
+    equilibriumMomentVector[1] = -2.0f * totalDensity + 3.0f * totalDensity * uSquared;
+    equilibriumMomentVector[2] = totalDensity - 3.0f * totalDensity * uSquared;
+    equilibriumMomentVector[3] = totalDensity * vX;
+    equilibriumMomentVector[4] = -totalDensity * vX;
+    equilibriumMomentVector[5] = totalDensity * vY;
+    equilibriumMomentVector[6] = -totalDensity * vY;
+    equilibriumMomentVector[7] = totalDensity * (vX * vX - vY * vY);
+    equilibriumMomentVector[8] = totalDensity * vX * vY;
+
+    for (int i = 0; i < 9; i++) {
+        momentVector[i] = momentVector[i] - d_relaxationRates[i] * (momentVector[i] - equilibriumMomentVector[i]);
+    }
+
+    float newDensities[9] = {0};
+
+    for (int i = 0; i < 9; i++) {
+        for (int j = 0; j < 9; j++) {
+            newDensities[i] += d_transformationMatrixInverse[i][j] * momentVector[j];
+        }
+    }
+
+    for (int d = 0; d < 9; d++) {
+        microDensity[d * cellCount + n] = newDensities[d];
     }
 }
 
@@ -376,7 +498,7 @@ int main() {
         }
 
         for (int step = 0; step < stepsPerFrame; step++) {
-            collision<<<blocks, threads>>>(microDensity, macroDensity, xVelocity, yVelocity, barrier, cellCount);
+            collisionMRT<<<blocks, threads>>>(microDensity, macroDensity, xVelocity, yVelocity, barrier, cellCount);
             streaming<<<blocks, threads>>>(microDensity, microDensity2, barrier, xSize, ySize, cellCount);
             advectSmoke<<<blocks, threads>>>(smoke, smoke2, xVelocity, yVelocity, barrier, xSize, ySize, cellCount, smokeAdvectionScale);
             cudaError_t err = cudaGetLastError();

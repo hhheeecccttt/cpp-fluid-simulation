@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/hwang/projects/LBM/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
